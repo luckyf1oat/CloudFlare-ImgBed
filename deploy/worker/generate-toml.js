@@ -1,6 +1,8 @@
 /**
  * 自动创建 Cloudflare 资源并生成 wrangler.toml
  * 
+ * 使用 Cloudflare API 直接创建资源（无需 wrangler CLI 的 JSON 输出支持）
+ * 
  * 功能：
  * 1. 自动创建 KV 命名空间 `img_url`（如果不存在）
  * 2. 自动创建 R2 存储桶 `img_r2`（如果不存在）
@@ -15,7 +17,6 @@
  * 使用方式: node deploy/worker/generate-toml.js
  */
 
-import { execSync } from 'child_process';
 import { writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -28,170 +29,136 @@ const prefix = process.env.RESOURCE_PREFIX || '';
 const KV_NAMESPACE = `${prefix}img_url`;
 const R2_BUCKET = `${prefix}img_r2`;
 
-/**
- * 执行 wrangler 命令并返回输出
- */
-function runWrangler(args) {
-    try {
-        const output = execSync(`npx wrangler ${args} --format json 2>&1`, {
-            encoding: 'utf-8',
-            timeout: 30000,
-        });
-        return output.trim();
-    } catch (error) {
-        console.error(`wrangler ${args} failed:`, error.message);
-        return '';
-    }
-}
+const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
 
 /**
- * 解析 wrangler 的 JSON 输出（兼容不同命令的输出格式）
+ * 调用 Cloudflare API
  */
-function parseJsonOutput(output) {
-    if (!output) return null;
-    // 找到第一个 { 到最后一个 }
-    const start = output.indexOf('{');
-    const end = output.lastIndexOf('}');
-    if (start === -1 || end === -1) return null;
-    try {
-        return JSON.parse(output.slice(start, end + 1));
-    } catch {
-        return null;
+async function cfApi(method, path, body = null) {
+    const url = `${CF_API_BASE}${path}`;
+    const options = {
+        method,
+        headers: {
+            'Authorization': `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+            'Content-Type': 'application/json',
+        },
+    };
+    if (body) {
+        options.body = JSON.stringify(body);
     }
-}
 
-/**
- * 获取所有 KV 命名空间列表
- */
-function listKVNamespaces() {
-    const output = runWrangler('kv namespace list');
-    if (!output) return [];
-    // wrangler 输出可能是 JSON 数组或包含额外文本
-    try {
-        const json = output.trim();
-        return JSON.parse(json);
-    } catch {
-        return [];
-    }
-}
+    const response = await fetch(url, options);
+    const data = await response.json();
 
-/**
- * 创建 KV 命名空间
- */
-function createKVNamespace(name) {
-    const output = runWrangler(`kv namespace create "${name}"`);
-    const result = parseJsonOutput(output);
-    if (result && result.id) {
-        console.log(`  Created KV namespace "${name}" with id: ${result.id}`);
-        return result.id;
+    if (!data.success) {
+        const errors = data.errors?.map(e => e.message).join(', ') || 'Unknown error';
+        throw new Error(`API error: ${errors}`);
     }
-    return null;
+
+    return data.result;
 }
 
 /**
  * 获取或创建 KV 命名空间
  */
-function ensureKVNamespace(name) {
+async function ensureKVNamespace(name, accountId) {
     console.log(`\n[KV] Ensuring namespace "${name}"...`);
-    const namespaces = listKVNamespaces();
+
+    // 获取所有 KV 命名空间
+    const namespaces = await cfApi('GET', `/accounts/${accountId}/storage/kv/namespaces`);
     const existing = namespaces.find(n => n.title === name);
+
     if (existing) {
         console.log(`  Found existing KV namespace: ${existing.id}`);
         return existing.id;
     }
+
+    // 创建新的 KV 命名空间
     console.log(`  Namespace "${name}" not found, creating...`);
-    return createKVNamespace(name);
+    const result = await cfApi('POST', `/accounts/${accountId}/storage/kv/namespaces`, {
+        title: name,
+    });
+    console.log(`  Created KV namespace "${name}" with id: ${result.id}`);
+    return result.id;
 }
 
 /**
- * 获取所有 R2 存储桶列表（通过 wrangler 输出）
+ * 获取或创建 R2 存储桶
  */
-function listR2Buckets() {
-    const output = runWrangler('r2 bucket list');
-    if (!output) return [];
-    try {
-        const json = output.trim();
-        if (Array.isArray(JSON.parse(json))) {
-            return JSON.parse(json);
-        }
-        return [];
-    } catch {
-        return [];
-    }
-}
-
-/**
- * 创建 R2 存储桶
- */
-function createR2Bucket(name) {
-    try {
-        execSync(`npx wrangler r2 bucket create "${name}" 2>&1`, {
-            encoding: 'utf-8',
-            timeout: 30000,
-        });
-        console.log(`  Created R2 bucket "${name}"`);
-        return true;
-    } catch (error) {
-        console.error(`  Failed to create R2 bucket: ${error.message}`);
-        return false;
-    }
-}
-
-/**
- * 确保 R2 存储桶存在
- */
-function ensureR2Bucket(name) {
+async function ensureR2Bucket(name, accountId) {
     console.log(`\n[R2] Ensuring bucket "${name}"...`);
-    const buckets = listR2Buckets();
-    const existing = buckets.find(b => b.name === name);
-    if (existing) {
+
+    try {
+        // 尝试获取桶（如果存在则返回）
+        const existing = await cfApi('GET', `/accounts/${accountId}/r2/buckets/${name}`);
         console.log(`  Found existing R2 bucket: ${name}`);
         return true;
+    } catch (error) {
+        // 桶不存在，创建新桶
+        console.log(`  Bucket "${name}" not found, creating...`);
+        try {
+            await cfApi('POST', `/accounts/${accountId}/r2/buckets`, {
+                name: name,
+            });
+            console.log(`  Created R2 bucket "${name}"`);
+            return true;
+        } catch (createError) {
+            console.error(`  Failed to create R2 bucket: ${createError.message}`);
+            return false;
+        }
     }
-    console.log(`  Bucket "${name}" not found, creating...`);
-    return createR2Bucket(name);
 }
 
 // ==================== 主流程 ====================
 
-console.log('=== Cloudflare ImgBed Deployment Config Generator ===');
-console.log(`Worker name: ${WORKER_NAME}`);
-console.log(`KV namespace: ${KV_NAMESPACE}`);
-console.log(`R2 bucket: ${R2_BUCKET}`);
+async function main() {
+    console.log('=== Cloudflare ImgBed Deployment Config Generator ===');
+    console.log(`Worker name: ${WORKER_NAME}`);
+    console.log(`KV namespace: ${KV_NAMESPACE}`);
+    console.log(`R2 bucket: ${R2_BUCKET}`);
 
-const apiToken = process.env.CLOUDFLARE_API_TOKEN;
-const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+    const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+    const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
 
-if (!apiToken || !accountId) {
-    console.log('\n⚠ CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID not set.');
-    console.log('  Skipping resource auto-creation. Using manual bindings from wrangler.toml template.');
-    // 生成只包含基础配置的 toml（不含绑定）
-    generateToml(null, null, null);
-    process.exit(0);
-}
+    if (!apiToken || !accountId) {
+        console.log('\n⚠ CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID not set.');
+        console.log('  Skipping resource auto-creation. Generating minimal wrangler.toml.');
+        generateToml(WORKER_NAME, null, null);
+        return;
+    }
 
-// 1. 确保 KV 命名空间存在
-const kvId = ensureKVNamespace(KV_NAMESPACE);
+    let kvId = null;
+    let r2Created = false;
 
-// 2. 确保 R2 存储桶存在
-const r2Created = ensureR2Bucket(R2_BUCKET);
+    try {
+        // 1. 确保 KV 命名空间存在
+        kvId = await ensureKVNamespace(KV_NAMESPACE, accountId);
+        console.log(`  ✅ KV namespace ready: ${kvId}`);
+    } catch (error) {
+        console.error(`\n✗ Failed to setup KV namespace: ${error.message}`);
+        console.log('  Continuing with minimal config...');
+    }
 
-// 3. 生成 wrangler.toml
-if (kvId || process.env.VITE_CI) {
+    try {
+        // 2. 确保 R2 存储桶存在
+        r2Created = await ensureR2Bucket(R2_BUCKET, accountId);
+        if (r2Created) {
+            console.log(`  ✅ R2 bucket ready: ${R2_BUCKET}`);
+        }
+    } catch (error) {
+        console.error(`\n✗ Failed to setup R2 bucket: ${error.message}`);
+        console.log('  Continuing without R2...');
+    }
+
+    // 3. 生成 wrangler.toml
     console.log('\n[Config] Generating wrangler.toml...');
-    generateToml(WORKER_NAME, kvId, R2_BUCKET);
+    generateToml(WORKER_NAME, kvId, r2Created ? R2_BUCKET : null);
     console.log('Done!');
-} else {
-    console.error('\n✗ Failed to create KV namespace. Deployment may fail.');
-    process.exit(1);
 }
 
-/**
- * 生成 wrangler.toml
- */
 function generateToml(name, kvId, r2Bucket) {
     const workerName = name || WORKER_NAME;
-    
+
     let toml = `name = "${workerName}"
 main = "index.js"
 compatibility_date = "2024-08-21"
@@ -227,3 +194,10 @@ bucket_name = "${r2Bucket}"
     console.log('\nGenerated deploy/worker/wrangler.toml:');
     console.log(safeToml);
 }
+
+main().catch(error => {
+    console.error('\n✗ Fatal error:', error.message);
+    console.log('  Generating minimal wrangler.toml...');
+    generateToml(WORKER_NAME, null, null);
+    process.exit(1);
+});
