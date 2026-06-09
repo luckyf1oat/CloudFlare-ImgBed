@@ -88,22 +88,51 @@ async function ensureKVNamespace(name, accountId) {
 async function ensureR2Bucket(name, accountId) {
     console.log(`\n[R2] Ensuring bucket "${name}"...`);
 
+    let buckets = [];
     try {
-        // 尝试获取桶（如果存在则返回）
-        const existing = await cfApi('GET', `/accounts/${accountId}/r2/buckets/${name}`);
-        console.log(`  Found existing R2 bucket: ${name}`);
-        return true;
-    } catch (error) {
-        // 桶不存在，创建新桶
-        console.log(`  Bucket "${name}" not found, creating...`);
-        try {
-            await cfApi('POST', `/accounts/${accountId}/r2/buckets`, {
-                name: name,
-            });
-            console.log(`  Created R2 bucket "${name}"`);
+        // 列出所有 R2 存储桶，检查是否已存在
+        console.log(`  [DEBUG] Fetching R2 bucket list via API...`);
+        const result = await cfApi('GET', `/accounts/${accountId}/r2/buckets`);
+        console.log(`  [DEBUG] R2 API response type: ${typeof result}, isArray: ${Array.isArray(result)}`);
+        buckets = Array.isArray(result) ? result : (result.buckets || []);
+        console.log(`  [DEBUG] Found ${buckets.length} existing R2 buckets`);
+        
+        const existing = buckets.find(b => b.name === name);
+        if (existing) {
+            console.log(`  Found existing R2 bucket: ${name}`);
             return true;
-        } catch (createError) {
-            console.error(`  Failed to create R2 bucket: ${createError.message}`);
+        }
+        console.log(`  Bucket "${name}" not in list`);
+    } catch (error) {
+        console.log(`  Warning: Could not list R2 buckets: ${error.message}`);
+    }
+
+    // 桶不存在，创建新桶
+    console.log(`  Creating R2 bucket "${name}"...`);
+    try {
+        console.log(`  [DEBUG] POST /accounts/${accountId}/r2/buckets`);
+        const createResult = await cfApi('POST', `/accounts/${accountId}/r2/buckets`, {
+            name: name,
+        });
+        console.log(`  [DEBUG] Create result:`, JSON.stringify(createResult));
+        console.log(`  ✅ Created R2 bucket "${name}"`);
+        return true;
+    } catch (createError) {
+        console.error(`  ❌ Failed to create R2 bucket: ${createError.message}`);
+        // Try wrangler CLI as primary fallback for R2 creation
+        // (Cloudflare R2 API sometimes requires specific permissions that wrangler handles)
+        console.log(`  Trying wrangler CLI to create R2 bucket...`);
+        try {
+            const { execSync } = await import('child_process');
+            execSync(`npx wrangler r2 bucket create "${name}"`, {
+                encoding: 'utf-8',
+                timeout: 30000,
+                stdio: 'inherit',
+            });
+            console.log(`  ✅ Created R2 bucket "${name}" via wrangler`);
+            return true;
+        } catch (wranglerError) {
+            console.error(`  ❌ wrangler fallback also failed: ${wranglerError.message}`);
             return false;
         }
     }
